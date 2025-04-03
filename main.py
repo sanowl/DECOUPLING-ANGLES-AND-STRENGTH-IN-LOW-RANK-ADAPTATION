@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 from typing import List, Optional
-
+from collections import OrderedDict
 class DeLoRA(nn.Module):
     def __init__(
         self,
@@ -15,34 +15,30 @@ class DeLoRA(nn.Module):
         device: Optional[torch.device] = None,
         dtype: Optional[torch.dtype] = None
     ):
+        if r <= 0:
+            raise ValueError("Rank must be positive")
+        if r > min(pretrained_W.size()):
+            raise ValueError("Rank cannot exceed min(out_features, in_features)")
+        if lambda_init <= 0:
+            raise ValueError("lambda_init must be positive")
+            
         super(DeLoRA, self).__init__()
-        
-        # Store pre-trained weight and its Frobenius norm
         self.pretrained_W = pretrained_W  # Shape: (out_features, in_features)
         self.r = r
         self.epsilon = epsilon
         self.norm_W = torch.norm(pretrained_W, p='fro')  # Scalar
-        
-        # Trainable parameters
         out_features, in_features = pretrained_W.size()
         self.B = nn.Parameter(torch.empty(out_features, r, device=device, dtype=dtype))
         self.A = nn.Parameter(torch.empty(r, in_features, device=device, dtype=dtype))
         self.lambda_param = nn.Parameter(torch.tensor(lambda_init, device=device, dtype=dtype))
-        
-        # Buffers for initial values (non-trainable)
         self.register_buffer('B0', self.B.detach().clone())
         self.register_buffer('A0', self.A.detach().clone())
         self.register_buffer('lambda0', self.lambda_param.detach().clone())
-        
-        # Optional bias
         if bias:
             self.bias = nn.Parameter(torch.empty(out_features, device=device, dtype=dtype))
         else:
             self.register_parameter('bias', None)
-        
-        # Initialize parameters
         self.reset_parameters()
-    
     def reset_parameters(self):
         """Initialize A and B using Kaiming normal initialization."""
         nn.init.kaiming_normal_(self.A, a=math.sqrt(5))
@@ -51,47 +47,44 @@ class DeLoRA(nn.Module):
             fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.B)
             bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
             nn.init.uniform_(self.bias, -bound, bound)
-    
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Forward pass of the DeLoRA layer.
-        
-        Args:
-            x (torch.Tensor): Input tensor of shape (batch_size, in_features).
-        
-        Returns:
-            torch.Tensor: Output tensor of shape (batch_size, out_features).
-        """
-        # Handle 1D input
         if x.dim() == 1:
             x = x.unsqueeze(0)
         batch_size = x.size(0)
-        # Compute A x and A0 x
-        A_x = self.A @ x.T    # Shape: (r, batch_size)
-        A0_x = self.A0 @ x.T  # Shape: (r, batch_size)
-        
-        # Component-wise normalization
-        norm_b = torch.norm(self.B, dim=0)  # Shape: (r,)
-        norm_a = torch.norm(self.A, dim=1)  # Shape: (r,)
-        xi = 1.0 / (norm_b * norm_a + self.epsilon)  # Shape: (r,)
-        
+        A_x = self.A @ x.T    
+        A0_x = self.A0 @ x.T
+        norm_b = torch.norm(self.B, dim=0)  
+        norm_a = torch.norm(self.A, dim=1)  
+        xi = 1.0 / (norm_b * norm_a + self.epsilon)  
         norm_b0 = torch.norm(self.B0, dim=0)  # Shape: (r,)
         norm_a0 = torch.norm(self.A0, dim=1)  # Shape: (r,)
         xi0 = 1.0 / (norm_b0 * norm_a0 + self.epsilon)  # Shape: (r,)
-        
         # Compute dynamic and initial updates
         delta_y = (self.lambda_param * self.norm_W / self.r) * (self.B @ (xi[:, None] * A_x))
         delta_y0 = (self.lambda0 * self.norm_W / self.r) * (self.B0 @ (xi0[:, None] * A0_x))
-        
         # Pre-trained output
         W_x = self.pretrained_W @ x.T  # Shape: (out_features, batch_size)
-        
         # Combine components
         y = W_x + delta_y - delta_y0  # Shape: (out_features, batch_size)
         if self.bias is not None:
             y = y + self.bias.unsqueeze(1)
-        
         return y.T  # Shape: (batch_size, out_features)
+
+    def get_effective_learning_rate(self) -> torch.Tensor:
+        """Compute the effective learning rate scaling factor."""
+        norm_b = torch.norm(self.B, dim=0)
+        norm_a = torch.norm(self.A, dim=1)
+        xi = 1.0 / (norm_b * norm_a + self.epsilon)
+        return (self.lambda_param * self.norm_W / self.r) * xi
+
+    def get_parameter_stats(self) -> dict:
+        """Return statistics about the parameters."""
+        return {
+            'lambda': self.lambda_param.item(),
+            'B_norm_mean': torch.norm(self.B, dim=0).mean().item(),
+            'A_norm_mean': torch.norm(self.A, dim=1).mean().item(),
+            'effective_lr_mean': self.get_effective_learning_rate().mean().item()
+        }
 
 class DeLoRAModel(nn.Module):
     """
@@ -122,7 +115,6 @@ class DeLoRAModel(nn.Module):
         self.bias = bias
         self.epsilon = epsilon
         self.converted_modules = []
-        
         self._apply_delora()
     
     def _apply_delora(self):
@@ -202,17 +194,14 @@ class DeLoRAModel(nn.Module):
                 nn.init.kaiming_normal_(delora.A, a=math.sqrt(5))
                 nn.init.kaiming_normal_(delora.B, a=math.sqrt(5))
                 delora.lambda_param.data.fill_(1.0)
-
 class DeLoRALinearWrapper(nn.Module):
     """Combines a linear layer with a DeLoRA module."""
     def __init__(self, linear: nn.Linear, delora: DeLoRA):
         super().__init__()
         self.linear = linear
         self.delora = delora
-    
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.delora(x) + (self.linear.bias if self.linear.bias is not None else 0)
-
 # Example Usage
 if __name__ == "__main__":
     class SimpleModel(nn.Module):
