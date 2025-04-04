@@ -4,6 +4,7 @@ import torch.nn.functional as F
 import math
 from typing import List, Optional
 from collections import OrderedDict
+
 class DeLoRA(nn.Module):
     def __init__(
         self,
@@ -23,7 +24,7 @@ class DeLoRA(nn.Module):
             raise ValueError("lambda_init must be positive")
             
         super(DeLoRA, self).__init__()
-        self.pretrained_W = pretrained_W  # Shape: (out_features, in_features)
+        self.pretrained_W = pretrained_W
         self.r = r
         self.epsilon = epsilon
         self.norm_W = torch.norm(pretrained_W, p='fro')  # Scalar
@@ -59,17 +60,13 @@ class DeLoRA(nn.Module):
         norm_b0 = torch.norm(self.B0, dim=0)  # Shape: (r,)
         norm_a0 = torch.norm(self.A0, dim=1)  # Shape: (r,)
         xi0 = 1.0 / (norm_b0 * norm_a0 + self.epsilon)  # Shape: (r,)
-        # Compute dynamic and initial updates
         delta_y = (self.lambda_param * self.norm_W / self.r) * (self.B @ (xi[:, None] * A_x))
         delta_y0 = (self.lambda0 * self.norm_W / self.r) * (self.B0 @ (xi0[:, None] * A0_x))
-        # Pre-trained output
         W_x = self.pretrained_W @ x.T  # Shape: (out_features, batch_size)
-        # Combine components
         y = W_x + delta_y - delta_y0  # Shape: (out_features, batch_size)
         if self.bias is not None:
             y = y + self.bias.unsqueeze(1)
         return y.T  # Shape: (batch_size, out_features)
-
     def get_effective_learning_rate(self) -> torch.Tensor:
         """Compute the effective learning rate scaling factor."""
         norm_b = torch.norm(self.B, dim=0)
@@ -97,6 +94,8 @@ class DeLoRAModel(nn.Module):
         target_modules (Optional[List[str]]): Module names to replace with DeLoRA.
         bias (bool): Whether to include bias in DeLoRA modules.
         epsilon (float): Small value for numerical stability.
+        grad_scale (float): Gradient scaling factor.
+        max_grad_norm (Optional[float]): Maximum gradient norm for clipping.
     """
     def __init__(
         self,
@@ -106,6 +105,8 @@ class DeLoRAModel(nn.Module):
         target_modules: Optional[List[str]] = None,
         bias: bool = False,
         epsilon: float = 1e-6,
+        grad_scale: float = 1.0,
+        max_grad_norm: Optional[float] = None,
     ):
         super().__init__()
         self.model = model
@@ -114,6 +115,9 @@ class DeLoRAModel(nn.Module):
         self.target_modules = target_modules
         self.bias = bias
         self.epsilon = epsilon
+        self.grad_scale = grad_scale
+        self.max_grad_norm = max_grad_norm
+        self.is_training = True
         self.converted_modules = []
         self._apply_delora()
     
@@ -160,16 +164,51 @@ class DeLoRAModel(nn.Module):
         """Forward pass through the modified model."""
         return self.model(*args, **kwargs)
     
-    def get_delora_params(self) -> List[torch.Tensor]:
-        """Return trainable DeLoRA parameters for optimization."""
+    def get_delora_params(self, filter_requires_grad: bool = True) -> List[torch.Tensor]:
+        """Return DeLoRA parameters, optionally filtering by requires_grad."""
         params = []
         for _, module in self.model.named_modules():
             if isinstance(module, DeLoRALinearWrapper):
-                params.extend(module.delora.parameters())
+                if filter_requires_grad:
+                    params.extend(p for p in module.delora.parameters() if p.requires_grad)
+                else:
+                    params.extend(module.delora.parameters())
         return params
 
-    def merge_weights(self):
-        """Merge DeLoRA updates into the base model's weights."""
+    def train(self, mode: bool = True):
+        """Set training mode and handle DeLoRA parameters."""
+        super().train(mode)
+        self.is_training = mode
+        if not mode:  # eval mode
+            self._backup_and_freeze()
+        return self
+        
+    def _backup_and_freeze(self):
+        """Backup and freeze DeLoRA parameters during evaluation."""
+        for _, module in self.model.named_modules():
+            if isinstance(module, DeLoRALinearWrapper):
+                module.delora.eval_backup = {
+                    'A': module.delora.A.data.clone(),
+                    'B': module.delora.B.data.clone(),
+                    'lambda': module.delora.lambda_param.data.clone()
+                }
+                module.delora.A.requires_grad_(False)
+                module.delora.B.requires_grad_(False)
+                module.delora.lambda_param.requires_grad_(False)
+
+    def merge_weights(self, validation_fn=None):
+        """
+        Merge DeLoRA updates into base weights with optional validation.
+        
+        Args:
+            validation_fn: Optional callable that takes the model as input and returns
+                         a validation metric. If provided, will only merge if validation improves.
+        """
+        if validation_fn is not None:
+            original_state = {name: param.data.clone() for name, param in self.named_parameters()}
+            original_score = validation_fn(self)
+        
+        # Perform merge
         for _, module in self.model.named_modules():
             if isinstance(module, DeLoRALinearWrapper):
                 delora = module.delora
@@ -194,6 +233,44 @@ class DeLoRAModel(nn.Module):
                 nn.init.kaiming_normal_(delora.A, a=math.sqrt(5))
                 nn.init.kaiming_normal_(delora.B, a=math.sqrt(5))
                 delora.lambda_param.data.fill_(1.0)
+                
+        if validation_fn is not None:
+            new_score = validation_fn(self)
+            if new_score <= original_score:
+                # Revert if validation didn't improve
+                for name, param in self.named_parameters():
+                    param.data.copy_(original_state[name])
+                return False
+        return True
+
+    def state_dict(self, *args, **kwargs):
+        """Save DeLoRA-specific state."""
+        state_dict = super().state_dict(*args, **kwargs)
+        state_dict['delora_config'] = {
+            'rank': self.rank,
+            'lambda_init': self.lambda_init,
+            'target_modules': self.target_modules,
+            'bias': self.bias,
+            'epsilon': self.epsilon,
+            'grad_scale': self.grad_scale,
+            'max_grad_norm': self.max_grad_norm
+        }
+        return state_dict
+
+    def load_state_dict(self, state_dict, strict: bool = True):
+        """Load DeLoRA state with configuration validation."""
+        config = state_dict.pop('delora_config', None)
+        if config is not None:
+            for key, value in config.items():
+                if hasattr(self, key) and getattr(self, key) != value:
+                    raise ValueError(f"Configuration mismatch for {key}")
+        super().load_state_dict(state_dict, strict=strict)
+
+    def clip_grad_norm_(self):
+        """Apply gradient clipping if configured."""
+        if self.max_grad_norm is not None:
+            torch.nn.utils.clip_grad_norm_(self.get_delora_params(), self.max_grad_norm)
+
 class DeLoRALinearWrapper(nn.Module):
     """Combines a linear layer with a DeLoRA module."""
     def __init__(self, linear: nn.Linear, delora: DeLoRA):
@@ -235,5 +312,36 @@ if __name__ == "__main__":
     output = delora_model(x)
     print(f"Output shape: {output.shape}")
     
-    # Merge weights after training
-    delora_model.merge_weights()
+    # Training loop example
+    criterion = nn.MSELoss()
+    num_epochs = 10
+    target = torch.randn(5, 5)
+    val_x = torch.randn(5, 10)
+    val_target = torch.randn(5, 5)
+    for epoch in range(num_epochs):
+        delora_model.train()  # Enable training mode
+        
+        # Forward pass
+        output = delora_model(x)
+        loss = criterion(output, target)
+        
+        # Backward pass with gradient scaling
+        (loss * delora_model.grad_scale).backward()
+        delora_model.clip_grad_norm_()  # Apply gradient clipping
+        optimizer.step()
+        optimizer.zero_grad()
+        
+        # Validation
+        delora_model.eval()  # Temporarily freeze DeLoRA params
+        with torch.no_grad():
+            val_output = delora_model(val_x)
+            val_loss = criterion(val_output, val_target)
+        
+    # Merge weights if validation improves
+    def compute_validation_metric(model):
+        with torch.no_grad():
+            val_output = model(val_x)
+            val_loss = criterion(val_output, val_target)
+        return -val_loss.item()  # Example: higher is better
+    
+    delora_model.merge_weights(validation_fn=compute_validation_metric)
