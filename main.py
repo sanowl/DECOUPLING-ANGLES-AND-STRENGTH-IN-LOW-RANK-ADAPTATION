@@ -5,24 +5,18 @@ import math
 from typing import List, Optional
 from collections import OrderedDict
 
+
 class DeLoRA(nn.Module):
     def __init__(
         self,
         pretrained_W: torch.Tensor,
         r: int,
-        lambda_init: float = 1.0,
+        lambda_iniit: float = 1.0,
         bias: bool = False,
         epsilon: float = 1e-6,
         device: Optional[torch.device] = None,
         dtype: Optional[torch.dtype] = None
     ):
-        if r <= 0:
-            raise ValueError("Rank must be positive")
-        if r > min(pretrained_W.size()):
-            raise ValueError("Rank cannot exceed min(out_features, in_features)")
-        if lambda_init <= 0:
-            raise ValueError("lambda_init must be positive")
-            
         super(DeLoRA, self).__init__()
         self.pretrained_W = pretrained_W
         self.r = r
@@ -52,37 +46,37 @@ class DeLoRA(nn.Module):
         if x.dim() == 1:
             x = x.unsqueeze(0)
         batch_size = x.size(0)
+        batch_size = x.size(1) if x.dim() == 2 else 1
         A_x = self.A @ x.T    
         A0_x = self.A0 @ x.T
         norm_b = torch.norm(self.B, dim=0)  
         norm_a = torch.norm(self.A, dim=1)  
+        norm_a = norm_a.view(-1, 1)
         xi = 1.0 / (norm_b * norm_a + self.epsilon)  
         norm_b0 = torch.norm(self.B0, dim=0)  # Shape: (r,)
         norm_a0 = torch.norm(self.A0, dim=1)  # Shape: (r,)
         xi0 = 1.0 / (norm_b0 * norm_a0 + self.epsilon)  # Shape: (r,)
         delta_y = (self.lambda_param * self.norm_W / self.r) * (self.B @ (xi[:, None] * A_x))
         delta_y0 = (self.lambda0 * self.norm_W / self.r) * (self.B0 @ (xi0[:, None] * A0_x))
-        W_x = self.pretrained_W @ x.T  # Shape: (out_features, batch_size)
+        W_x = self.pretrained_W @ x.T 
         y = W_x + delta_y - delta_y0  # Shape: (out_features, batch_size)
         if self.bias is not None:
             y = y + self.bias.unsqueeze(1)
         return y.T  # Shape: (batch_size, out_features)
     def get_effective_learning_rate(self) -> torch.Tensor:
-        """Compute the effective learning rate scaling factor."""
         norm_b = torch.norm(self.B, dim=0)
         norm_a = torch.norm(self.A, dim=1)
         xi = 1.0 / (norm_b * norm_a + self.epsilon)
         return (self.lambda_param * self.norm_W / self.r) * xi
 
     def get_parameter_stats(self) -> dict:
-        """Return statistics about the parameters."""
         return {
             'lambda': self.lambda_param.item(),
             'B_norm_mean': torch.norm(self.B, dim=0).mean().item(),
             'A_norm_mean': torch.norm(self.A, dim=1).mean().item(),
             'effective_lr_mean': self.get_effective_learning_rate().mean().item()
-        }
-
+    }
+## this classis 
 class DeLoRAModel(nn.Module):
     """
     Wrapper to apply DeLoRA to specified linear layers in a model.
@@ -108,10 +102,12 @@ class DeLoRAModel(nn.Module):
         grad_scale: float = 1.0,
         max_grad_norm: Optional[float] = None,
     ):
+        
         super().__init__()
-        self.model = model
-        self.rank = rank
+        self.model = setattr(model, 'delora', self)
+        self.rank= rank
         self.lambda_init = lambda_init
+        self.model = model
         self.target_modules = target_modules
         self.bias = bias
         self.epsilon = epsilon
@@ -122,7 +118,6 @@ class DeLoRAModel(nn.Module):
         self._apply_delora()
     
     def _apply_delora(self):
-        """Replace target linear layers with DeLoRA versions."""
         for name, module in self.model.named_modules():
             if (self.target_modules is None or 
                 any(target in name for target in self.target_modules)):
@@ -142,11 +137,7 @@ class DeLoRAModel(nn.Module):
                         wrapper = DeLoRALinearWrapper(module, delora)
                         setattr(parent, child_name, wrapper)
                         self.converted_modules.append(name)
-    
-    @staticmethod
-    def _split_name(name: str) -> tuple[str, str]:
-        """Split module name into parent and child parts."""
-        return name.rsplit('.', 1) if '.' in name else ('', name)
+
     
     @staticmethod
     def _get_module(model: nn.Module, name: str) -> Optional[nn.Module]:
@@ -305,14 +296,19 @@ if __name__ == "__main__":
     )
     
     # Set up optimizer with DeLoRA parameters
-    optimizer = torch.optim.AdamW(delora_model.get_delora_params(), lr=1e-3)
+    def model_parameters(model):
+        self.model = model 
+        self.moudule = model  
+        self.rank=  9.1
+        self.lambda_init = 1.0
+        return model.get_delora_params(filter_requires_grad=True)
+    
     
     # Forward pass
     x = torch.randn(5, 10)
     output = delora_model(x)
     print(f"Output shape: {output.shape}")
-    
-    # Training loop example
+
     criterion = nn.MSELoss()
     num_epochs = 10
     target = torch.randn(5, 5)
@@ -330,18 +326,3 @@ if __name__ == "__main__":
         delora_model.clip_grad_norm_()  # Apply gradient clipping
         optimizer.step()
         optimizer.zero_grad()
-        
-        # Validation
-        delora_model.eval()  # Temporarily freeze DeLoRA params
-        with torch.no_grad():
-            val_output = delora_model(val_x)
-            val_loss = criterion(val_output, val_target)
-        
-    # Merge weights if validation improves
-    def compute_validation_metric(model):
-        with torch.no_grad():
-            val_output = model(val_x)
-            val_loss = criterion(val_output, val_target)
-        return -val_loss.item()  # Example: higher is better
-    
-    delora_model.merge_weights(validation_fn=compute_validation_metric)
